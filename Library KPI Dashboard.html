@@ -1,0 +1,1285 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <title>📊 HQ KPI Generator</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.39.0/build/stlite.css" />
+  </head>
+  <body>
+    <div id="root" style="height: 100vh;"></div>
+    
+    <script type="text/python" id="my_python_code">
+
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import io
+from datetime import datetime
+
+st.set_page_config(page_title="Library KPI Generator", layout="wide")
+
+st.markdown("""
+    <style>
+        .stApp > header { border-bottom: 5px solid transparent; }
+        [data-testid="stAppViewBlockContainer"] { padding-top: 2rem; }
+        .st-emotion-cache-1vt4ygl { height: 10px !important; background-color: #00cc96 !important; }
+    </style>
+""", unsafe_allow_html=True)
+
+st.title("📊 Library Key Performance Indicator (KPI) Generator")
+st.info("This tool can be used to automatically process KPI reports for circulation, as well as tracking programming and demographics.")
+
+# --- SESSION STATE ---
+if 'asip_pop' not in st.session_state: st.session_state['asip_pop'] = 0
+if 'kpi_df_base' not in st.session_state: st.session_state['kpi_df_base'] = pd.DataFrame()
+if 'rules_df' not in st.session_state: st.session_state['rules_df'] = pd.DataFrame(columns=["location", "genre", "itemtype", "KPI Category"])
+if 'prog_rules_df' not in st.session_state: st.session_state['prog_rules_df'] = pd.DataFrame(columns=["Program Title", "Category", "Sub-Category", "ACRRO Category", "Status"])
+if 'tracker_df' not in st.session_state:
+    st.session_state['tracker_df'] = pd.DataFrame(columns=[
+        "Program", "Date", "Length (Days)", "Total Participants",
+        "Participants - Toddler/Infant", "Participants - Preschool", 
+        "Participants - School Age", "Participants - Teen", "Participants - Adult", 
+        "Cost", "Income", "Staffing Used", "Planning (Hours)", "Duration (Hours)", 
+        "Volunteers", "Notes"
+    ])
+if 'patron_df' not in st.session_state:
+    st.session_state['patron_df'] = pd.DataFrame(columns=["Patron Category", "Service Branch", "Count"])
+
+# NEW: Item List State
+if 'item_list_df' not in st.session_state: st.session_state['item_list_df'] = pd.DataFrame()
+
+# File Override Trackers
+if 'last_global_file' not in st.session_state: st.session_state['last_global_file'] = None
+if 'last_count_file' not in st.session_state: st.session_state['last_count_file'] = None
+if 'last_circ_file' not in st.session_state: st.session_state['last_circ_file'] = None
+if 'last_item_file' not in st.session_state: st.session_state['last_item_file'] = None
+if 'last_uploaded_rules' not in st.session_state: st.session_state['last_uploaded_rules'] = None
+if 'last_prog_rules' not in st.session_state: st.session_state['last_prog_rules'] = None
+if 'last_up_tracker' not in st.session_state: st.session_state['last_up_tracker'] = None
+if 'last_up_patron' not in st.session_state: st.session_state['last_up_patron'] = None
+
+# --- GLOBAL WORKSPACE STATE ---
+workspace_expanded = st.session_state.get('last_global_file') is None
+with st.expander("💾 Global Workspace Save & Load", expanded=workspace_expanded):
+    st.info("Save your entire app state (reports, rules, trackers, and settings) into a single Central File, or load a previously saved workspace.")
+
+    g1, g2 = st.columns(2)
+    
+    with g1:
+        global_file = st.file_uploader("📂 Load Central Workspace (.xlsx)", type=['xlsx'], key="global_uploader")
+        if global_file and st.session_state.get('last_global_file') != global_file.name:
+            try:
+                xls = pd.ExcelFile(global_file, engine='openpyxl')
+                
+                if 'Settings' in xls.sheet_names:
+                    set_df = pd.read_excel(xls, sheet_name='Settings')
+                    if not set_df.empty and 'ASIP Population' in set_df.columns:
+                        st.session_state['asip_pop'] = int(set_df['ASIP Population'].iloc[0])
+
+                if 'BaseData' in xls.sheet_names: 
+                    st.session_state['kpi_df_base'] = pd.read_excel(xls, sheet_name='BaseData')
+                
+                if 'ItemList' in xls.sheet_names: 
+                    st.session_state['item_list_df'] = pd.read_excel(xls, sheet_name='ItemList', dtype=str).fillna('')
+
+                if 'KPIRules' in xls.sheet_names:
+                    r_df = pd.read_excel(xls, sheet_name='KPIRules', dtype=str).fillna('')
+                    for c in ["location", "genre", "itemtype"]:
+                        if c in r_df.columns: r_df[c] = r_df[c].str.strip()
+                    st.session_state['rules_df'] = r_df
+                    
+                if 'ProgRules' in xls.sheet_names: 
+                    st.session_state['prog_rules_df'] = pd.read_excel(xls, sheet_name='ProgRules', dtype=str).fillna('')
+                    
+                if 'Tracker' in xls.sheet_names:
+                    t_df = pd.read_excel(xls, sheet_name='Tracker')
+                    if 'Date' in t_df.columns: t_df['Date'] = pd.to_datetime(t_df['Date']).dt.date
+                    st.session_state['tracker_df'] = t_df
+                    
+                if 'Patrons' in xls.sheet_names:
+                    st.session_state['patron_df'] = pd.read_excel(xls, sheet_name='Patrons')
+                
+                st.session_state['last_global_file'] = global_file.name
+                st.success("Workspace loaded successfully!")
+                st.experimental_rerun()
+            except Exception as e:
+                st.error(f"Error loading workspace: {e}")
+    
+    with g2:
+        st.write("Save your current progress:")
+        
+        # 1. Provide a button to trigger the heavy Excel compilation
+        if st.button("📦 Package Workspace for Download"):
+            with st.spinner("Bundling your data... this may take a moment due to the size of the Item List."):
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    pd.DataFrame([{'ASIP Population': st.session_state['asip_pop']}]).to_excel(writer, sheet_name='Settings', index=False)
+                    if not st.session_state['kpi_df_base'].empty:
+                        st.session_state['kpi_df_base'].to_excel(writer, sheet_name='BaseData', index=False)
+                    if not st.session_state['item_list_df'].empty:
+                        st.session_state['item_list_df'].to_excel(writer, sheet_name='ItemList', index=False)
+                    st.session_state['rules_df'].to_excel(writer, sheet_name='KPIRules', index=False)
+                    st.session_state['prog_rules_df'].to_excel(writer, sheet_name='ProgRules', index=False)
+                    st.session_state['tracker_df'].to_excel(writer, sheet_name='Tracker', index=False)
+                    st.session_state['patron_df'].to_excel(writer, sheet_name='Patrons', index=False)
+                
+                # Store the compiled bytes in session state
+                st.session_state['ready_excel_bytes'] = output.getvalue()
+                
+        # 2. Only show the download button IF the package has been compiled
+        if st.session_state.get('ready_excel_bytes') is not None:
+            st.success("Ready! If you make further changes, click 'Package Workspace' again to refresh the file.")
+            st.download_button(
+                label="📥 Download Central Workspace",
+                data=st.session_state['ready_excel_bytes'],
+                file_name="Library_Central_Workspace.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+
+@st.cache_data
+def load_data(file):
+    if file.name.endswith('.xlsx'):
+        return pd.read_excel(file, engine='openpyxl')
+    else:
+        return pd.read_csv(file)
+
+# ==========================================
+# MAIN NAVIGATION & GLOBAL SETTINGS
+# ==========================================
+st.subheader("Global Library Settings")
+
+new_asip = st.number_input("ASIP Population (Required for Per Capita metrics)", min_value=0, value=st.session_state['asip_pop'], step=100)
+if new_asip != st.session_state['asip_pop']:
+    st.session_state['asip_pop'] = new_asip
+    st.experimental_rerun()
+    
+st.divider()
+
+active_tab = st.radio("Navigation", ["🔄 Turnover & Use", "📅 Programming", "👥 Patrons"], horizontal=True, label_visibility="collapsed")
+st.divider()
+
+# ==========================================
+# TAB 1: TURNOVER & USE
+# ==========================================
+if active_tab == "🔄 Turnover & Use":
+    
+    turn_tab = st.radio("Turnover Views", ["⚙️ Data & Rules Engine", "📊 KPI Dashboard", "🔎 Collection Viewer"], horizontal=True)
+    st.divider()
+    
+    # ------------------------------------------
+    # SUB-TAB: RULES ENGINE & UPLOADS
+    # ------------------------------------------
+    if turn_tab == "⚙️ Data & Rules Engine":
+        st.subheader("Collection Settings & Data Upload")
+        st.info("Upload your Count, Item, and Circulation reports. The app will merge them and allow you to dynamically map your collection categories. Note that if you upload the Item report, you do not need the Count report, since the Item report contains the counts.")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            circ_file = st.file_uploader("1. Circulation Report (Required)", type=['csv', 'xlsx'])
+        with col2:
+            item_file = st.file_uploader("2. Item List (Recommended)", type=['csv', 'xlsx'])
+        with col3:
+            count_file = st.file_uploader("3. Count Report (Fallback)", type=['csv', 'xlsx'])
+
+        # Process new Item List file
+        if item_file and st.session_state.get('last_item_file') != item_file.name:
+            st.session_state['item_list_df'] = load_data(item_file).astype(str).fillna('')
+            st.session_state['last_item_file'] = item_file.name
+            st.success("Item List Report loaded successfully!")
+            st.experimental_rerun()
+
+        # Generate base data if we have Circ + (Item OR Count)
+        if circ_file and (not st.session_state['item_list_df'].empty or count_file):
+            circ_name = circ_file.name
+            item_name = item_file.name if item_file else "None"
+            count_name = count_file.name if count_file else "None"
+            
+            # OVERRIDE LOCK
+            if (st.session_state.get('last_circ_file') != circ_name or 
+                st.session_state.get('last_count_file') != count_name or
+                st.session_state.get('last_item_file_base') != item_name):
+                
+                df_circ = load_data(circ_file)
+                if '# Circulation' in df_circ.columns:
+                    df_circ = df_circ.rename(columns={'# Circulation': 'circulation'})
+
+                if not st.session_state['item_list_df'].empty:
+                    df_raw_items = st.session_state['item_list_df'].copy()
+                    df_raw_items = df_raw_items.rename(columns={'homebranch': 'branch', "JSON_VALUE(items.fields, '$.genre')": 'genre'})
+                    
+                    if 'COUNT' in df_raw_items.columns:
+                        df_raw_items['count'] = pd.to_numeric(df_raw_items['COUNT'], errors='coerce').fillna(1)
+                    else:
+                        df_raw_items['count'] = 1
+                    
+                    key_cols = ['branch', 'location', 'genre', 'itemtype']
+                    for col in key_cols:
+                        if col not in df_raw_items.columns: df_raw_items[col] = ""
+                        
+                    df_count = df_raw_items.groupby(key_cols)['count'].sum().reset_index()
+                else:
+                    df_count = load_data(count_file)
+                    df_count = df_count.rename(columns={'homebranch': 'branch', "JSON_VALUE(items.fields, '$.genre')": 'genre', 'COUNT': 'count'})
+
+                key_cols = ['location', 'genre', 'itemtype']
+                for df in [df_count, df_circ]:
+                    for col in key_cols:
+                        if col in df.columns:
+                            df[col] = df[col].astype(str).str.strip().replace('nan', '').replace('None', '')
+
+                merge_keys = ['branch', 'location', 'genre', 'itemtype']
+                df_circ['circulation'] = pd.to_numeric(df_circ['circulation'], errors='coerce').fillna(0)
+                df_count['count'] = pd.to_numeric(df_count['count'], errors='coerce').fillna(0)
+
+                kpi_df_base = pd.merge(df_count, df_circ, on=merge_keys, how='left')
+                kpi_df_base['circulation'] = kpi_df_base['circulation'].fillna(0)
+                
+                st.session_state['kpi_df_base'] = kpi_df_base
+                st.session_state['last_circ_file'] = circ_name
+                st.session_state['last_count_file'] = count_name
+                st.session_state['last_item_file_base'] = item_name
+                st.experimental_rerun()
+
+        if not st.session_state['kpi_df_base'].empty:
+            with st.expander("⚙️ KPI Mapping Rules (Expand to Edit)", expanded=True):
+                st.info("Upload a saved mapping file or use 'Auto-Discover' to define categories. Enter your categories under the KPI Categories column. Note that using identical names will merge categories. For example, if you identify Juvenile + Fiction + Board Book as Board Books and Juvenile + Picture + Board Books as Board Books, the system will automatically combine them into a single category.")
+
+                col_imp, col_auto = st.columns(2)
+                with col_imp:
+                    up_rules = st.file_uploader("📂 Load Saved Rules (CSV)", type=['csv'], key="rules_uploader")
+                    if up_rules and st.session_state['last_uploaded_rules'] != up_rules.name:
+                        imp_df = pd.read_csv(up_rules, dtype=str).fillna('')
+                        expected_cols = ["location", "genre", "itemtype", "KPI Category"]
+                        for c in expected_cols:
+                            if c not in imp_df.columns: imp_df[c] = ""
+                        for c in ["location", "genre", "itemtype"]:
+                            imp_df[c] = imp_df[c].str.strip()
+                        
+                        st.session_state['rules_df'] = imp_df[expected_cols]
+                        st.session_state['last_uploaded_rules'] = up_rules.name
+                        st.experimental_rerun()
+
+                with col_auto:
+                    if st.button("✨ Auto-Discover All"):
+                        key_cols = ['location', 'genre', 'itemtype']
+                        pats = st.session_state['kpi_df_base'].groupby(key_cols).size().reset_index(name="Count").sort_values("Count", ascending=False)
+                        new_rules = pd.DataFrame({
+                            "location": pats["location"],
+                            "genre": pats["genre"],
+                            "itemtype": pats["itemtype"],
+                            "KPI Category": "Uncategorized"
+                        })
+                        st.session_state['rules_df'] = new_rules
+                        st.experimental_rerun()
+
+                with st.form("rules_form"):
+                    edited_rules = st.data_editor(
+                        st.session_state['rules_df'], 
+                        num_rows="dynamic", 
+                        use_container_width=True,
+                        column_config={
+                            "location": st.column_config.TextColumn(disabled=True),
+                            "genre": st.column_config.TextColumn(disabled=True),
+                            "itemtype": st.column_config.TextColumn(disabled=True),
+                            "KPI Category": st.column_config.TextColumn(required=True)
+                        }
+                    )
+                    if st.form_submit_button("🔄 Update & Analyze"):
+                        st.session_state['rules_df'] = edited_rules
+                        st.experimental_rerun()
+
+                if not st.session_state['rules_df'].empty:
+                    csv_rules = st.session_state['rules_df'].to_csv(index=False).encode('utf-8')
+                    st.download_button("💾 Download Updated Rules", data=csv_rules, file_name="kpi_rules.csv", mime="text/csv")
+        else:
+            st.info("Upload your Circulation and Item List/Count reports above to begin.")
+
+    # ------------------------------------------
+    # VISUAL TABS (KPI Dashboard & Collection Viewer)
+    # ------------------------------------------
+    else:
+        if not st.session_state['kpi_df_base'].empty and not st.session_state['rules_df'].empty:
+            
+            # --- PRE-CALCULATE BASE METRICS FOR BOTH VISUAL TABS ---
+            active_rules = st.session_state['rules_df'].copy()
+            base_df = st.session_state['kpi_df_base'].copy()
+            key_cols = ['location', 'genre', 'itemtype']
+            
+            for c in key_cols:
+                active_rules[c] = active_rules[c].astype(str).str.strip().replace('nan', '').replace('None', '')
+                if c in base_df.columns:
+                    base_df[c] = base_df[c].astype(str).str.strip().replace('nan', '').replace('None', '')
+
+            kpi_df = pd.merge(base_df, active_rules, on=key_cols, how='left')
+            kpi_df['KPI Category'] = kpi_df['KPI Category'].replace('', 'Uncategorized').fillna('Uncategorized')
+
+            agg_df = kpi_df.groupby('KPI Category').agg(count=('count', 'sum'), circulation=('circulation', 'sum')).reset_index()
+            agg_df = agg_df[agg_df['count'] > 0].copy()
+
+            total_count = agg_df['count'].sum()
+            total_circ = agg_df['circulation'].sum()
+            overall_turnover = total_circ / total_count if total_count > 0 else 0
+
+            agg_df['percentage of collection'] = (agg_df['count'] / total_count).fillna(0)
+            agg_df['percentage of circulation'] = (agg_df['circulation'] / total_circ).fillna(0)
+            agg_df['turnover'] = (agg_df['circulation'] / agg_df['count']).fillna(0)
+            agg_df['relative use'] = (agg_df['percentage of circulation'] / agg_df['percentage of collection']).fillna(0)
+
+            # --- SUB-TAB: KPI DASHBOARD ---
+            if turn_tab == "📊 KPI Dashboard":
+                st.subheader("Collection Overview")
+                
+                asip = st.session_state.get('asip_pop', 0)
+                items_per_capita = total_count / asip if asip > 0 else 0
+                circ_per_capita = total_circ / asip if asip > 0 else 0
+                
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("Total Items", f"{total_count:,.0f}")
+                m2.metric("Total Circulation", f"{total_circ:,.0f}")
+                m3.metric("Overall Turnover", f"{overall_turnover:.2f}")
+                m4.metric("Items per Capita", f"{items_per_capita:.2f}" if asip > 0 else "N/A")
+                m5.metric("Circs per Capita", f"{circ_per_capita:.2f}" if asip > 0 else "N/A")
+                
+                turnover_metric_color = "#2ECC71" if overall_turnover >= 2.0 else "#F39C12" if overall_turnover >= 1.5 else "#E74C3C" if overall_turnover >= 1.0 else "#8B0000"
+                st.markdown(f"""
+                    <style>
+                        div[data-testid="column"]:nth-of-type(3) [data-testid="stMetricValue"] {{ color: {turnover_metric_color} !important; }}
+                    </style>
+                """, unsafe_allow_html=True)
+                
+                st.divider()
+
+                unique_cats = sorted(agg_df['KPI Category'].unique())
+                colors = px.colors.qualitative.Plotly
+                color_map = {cat: colors[i % len(colors)] for i, cat in enumerate(unique_cats)}
+                color_map["Other (<1%)"] = "#808080"
+
+                pie_df = agg_df.copy()
+                pie_df['coll_cat'] = pie_df.apply(lambda r: r['KPI Category'] if r['percentage of collection'] >= 0.01 else 'Other (<1%)', axis=1)
+                pie_df['circ_cat'] = pie_df.apply(lambda r: r['KPI Category'] if r['percentage of circulation'] >= 0.01 else 'Other (<1%)', axis=1)
+
+                pie_coll_agg = pie_df.groupby('coll_cat')['count'].sum().reset_index()
+                pie_circ_agg = pie_df.groupby('circ_cat')['circulation'].sum().reset_index()
+
+                pc1, pc2 = st.columns(2)
+                with pc1:
+                    fig_coll = px.pie(pie_coll_agg, names="coll_cat", values="count", title="Percentage of Collection (Items)", color="coll_cat", color_discrete_map=color_map)
+                    st.plotly_chart(fig_coll, use_container_width=True)
+                with pc2:
+                    fig_circ = px.pie(pie_circ_agg, names="circ_cat", values="circulation", title="Percentage of Circulation (Checkouts)", color="circ_cat", color_discrete_map=color_map)
+                    st.plotly_chart(fig_circ, use_container_width=True)
+
+                st.divider()
+
+                st.subheader("Aggregated KPI Data")
+                
+                def style_turnover(val):
+                    try: v = float(val)
+                    except: return ''
+                    if v >= 2.0: return 'background-color: #2ECC71; color: black;' 
+                    elif v >= 1.5: return 'background-color: #F39C12; color: black;' 
+                    elif v >= 1.0: return 'background-color: #E74C3C; color: white;' 
+                    else: return 'background-color: black; color: white;' 
+
+                def style_rel_use(val):
+                    try: v = float(val)
+                    except: return ''
+                    if v >= 1.0:
+                        intensity = min(1.0, (v - 1.0) / 2.0)
+                        lightness = 95 - (50 * intensity)
+                        text_color = "white" if lightness < 60 else "black"
+                        return f'background-color: hsl(145, 100%, {lightness}%); color: {text_color};'
+                    else:
+                        intensity = 1.0 - max(0.0, v)
+                        lightness = 95 - (45 * intensity)
+                        text_color = "white" if lightness < 65 else "black"
+                        return f'background-color: hsl(210, 100%, {lightness}%); color: {text_color};'
+
+                format_dict = {
+                    'count': '{:,.0f}', 'circulation': '{:,.0f}',
+                    'percentage of collection': '{:.2%}', 'percentage of circulation': '{:.2%}',
+                    'turnover': '{:.2f}', 'relative use': '{:.2f}'
+                }
+                
+                styled_df = agg_df.style.format(format_dict).applymap(style_turnover, subset=['turnover']).applymap(style_rel_use, subset=['relative use'])
+                st.dataframe(styled_df, use_container_width=True, hide_index=True)
+
+                csv_out = agg_df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download HQ KPI Report", csv_out, "hq_kpi_report.csv", "text/csv")
+                st.divider()
+
+                st.subheader("Performance Quadrant")
+                fig_quad = px.scatter(
+                    agg_df, x="turnover", y="relative use", 
+                    color="KPI Category", color_discrete_map=color_map,
+                    size="count", hover_name="KPI Category",
+                    labels={"turnover": "Turnover Rate", "relative use": "Relative Use"},
+                    height=600
+                )
+                
+                fig_quad.add_vline(x=overall_turnover, line_dash="dash", line_color="gray", annotation_text="Avg Turnover")
+                fig_quad.add_hline(y=1.0, line_dash="dash", line_color="gray", annotation_text="Break-Even (Rel Use = 1.0)")
+                fig_quad.add_vline(x=2.0, line_dash="dash", line_color="#2ECC71", annotation_text="Target Turnover")
+                
+                fig_quad.update_traces(marker=dict(line=dict(width=1, color='DarkSlateGrey')))
+                st.plotly_chart(fig_quad, use_container_width=True)
+
+            # --- SUB-TAB: COLLECTION VIEWER ---
+            elif turn_tab == "🔎 Collection Viewer":
+                st.subheader("Interactive Collection Explorer")
+                
+                if st.session_state['item_list_df'].empty:
+                    st.info("Upload the 'Item List' report in the 'Data & Rules Engine' tab to unlock this feature.")
+                else:
+                    items_df = st.session_state['item_list_df'].copy()
+                    
+                    for c in key_cols:
+                        if c in items_df.columns:
+                            items_df[c] = items_df[c].astype(str).str.strip().replace('nan', '').replace('None', '')
+                    
+                    mapped_items = pd.merge(items_df, active_rules, on=key_cols, how='left')
+                    mapped_items['KPI Category'] = mapped_items['KPI Category'].replace('', 'Uncategorized').fillna('Uncategorized')
+                    
+                    view_mode = st.radio("Search Mode", ["📂 Browse by Category", "✍️ Search by Title / Keyword"], horizontal=True)
+                    st.divider()
+                    
+                    if view_mode == "📂 Browse by Category":
+                        cats = sorted(mapped_items['KPI Category'].unique().tolist())
+                        selected_cat = st.selectbox("Select KPI Category to Inspect", cats)
+                        
+                        cat_stats = agg_df[agg_df['KPI Category'] == selected_cat]
+                        if not cat_stats.empty:
+                            cs = cat_stats.iloc[0]
+                            st.markdown(f"**Category Performance Snapshot:**")
+                            sc1, sc2, sc3, sc4 = st.columns(4)
+                            sc1.metric("Category Size", f"{cs['count']:,.0f} Items")
+                            sc2.metric("Total Checkouts", f"{cs['circulation']:,.0f}")
+                            
+                            to_color = "#2ECC71" if cs['turnover'] >= 2.0 else "#F39C12" if cs['turnover'] >= 1.5 else "#E74C3C" if cs['turnover'] >= 1.0 else "#8B0000"
+                            st.markdown(f"""
+                                <style>
+                                    div[data-testid="column"]:nth-of-type(3) [data-testid="stMetricValue"] {{ color: {to_color} !important; }}
+                                </style>
+                            """, unsafe_allow_html=True)
+                            sc3.metric("Turnover", f"{cs['turnover']:.2f}")
+                            sc4.metric("Relative Use", f"{cs['relative use']:.2f}")
+                            st.markdown("<br>", unsafe_allow_html=True)
+                            
+                        cat_items = mapped_items[mapped_items['KPI Category'] == selected_cat]
+                        st.dataframe(cat_items[['item_title', 'call_number', 'barcode', 'location', 'genre', 'itemtype']], use_container_width=True, hide_index=True)
+                        
+                    elif view_mode == "✍️ Search by Title / Keyword":
+                        st.info("💡 You can search any keyword or call number (i.e. Dewey number) to locate items. Note that the source file does not include concatenated subtitles, so only words in the main title are searchable")
+                        
+                        sq1, sq2 = st.columns(2)
+                        with sq1: q_call = st.text_input("Search Call Number (Author Prefix / Cutter)")
+                        with sq2: q_title = st.text_input("Search Title Keyword")
+                        
+                        res = mapped_items.copy()
+                        if q_call: res = res[res['call_number'].str.contains(q_call, case=False, na=False)]
+                        if q_title: res = res[res['item_title'].str.contains(q_title, case=False, na=False)]
+                        
+                        if q_call or q_title:
+                            st.markdown(f"**Found {len(res)} items:**")
+                            st.dataframe(res[['item_title', 'call_number', 'KPI Category', 'barcode']], use_container_width=True, hide_index=True)
+
+        else:
+            st.warning("Please upload your base reports and update your rules in the 'Data & Rules Engine' tab first.")
+
+# ==========================================
+# TAB 3: PROGRAMMING
+# ==========================================
+elif active_tab == "📅 Programming":
+    
+    # Sub-tabs for the Programming section
+    prog_tab = st.radio("Programming Views", ["📝 Program Definitions", "📅 Tracker", "📊 Basic Insights", "🚀 Advanced Insights"], horizontal=True)
+    st.divider()
+
+    # Alphabetical list with "Other" options at the end
+    acrro_options = [
+        "",
+        "Across MWR Partnerships", "ALA Annual Events", "Birthday Parties/Read Across America", 
+        "Book Clubs", "Book Talks at School/CYSS", "Contests", "Events (Training)", 
+        "Game Nights & Tournaments", "Guest Speakers", "Hobby Crafts", 
+        "Holiday and Commemorative Events", "Informational Classes/Activities", 
+        "Language Classes", "Lapsit & Early Literacy Programs", "Library Database Training", 
+        "Library Tours/Orientation", "Life Skills with BOSS", "Makerspace", "Movie Programming", 
+        "Puppet Shows", "Read to a Dog", "Scavenger Hunts", "Story Time", "Storywalks", 
+        "Summer Reading Program", "Winter Reading Program", "Writing Workshop",
+        "Other Events", "Other Promotions", "Other Reading", "Other Training"
+    ]
+
+    if prog_tab == "📝 Program Definitions":
+        st.subheader("Define Standard & Reoccurring Programs")
+        
+        up_prog = st.file_uploader("📂 Load Saved Program Rules (CSV)", type=['csv'], key="prog_uploader")
+        if up_prog and st.session_state['last_prog_rules'] != up_prog.name:
+            # Enforce string reading directly on CSV upload
+            imp_prog_df = pd.read_csv(up_prog, dtype=str).fillna('')
+            expected_prog_cols = ["Program Title", "Category", "Sub-Category", "ACRRO Category", "Status"]
+            for c in expected_prog_cols:
+                if c not in imp_prog_df.columns: 
+                    imp_prog_df[c] = "Active" if c == "Status" else ""
+            
+            st.session_state['prog_rules_df'] = imp_prog_df[expected_prog_cols]
+            st.session_state['last_prog_rules'] = up_prog.name
+            st.experimental_rerun()
+
+        st.markdown("#### ➕ Add a New Program")
+        with st.form("add_program_form", clear_on_submit=True):
+            existing_cats = [""] + sorted([str(x) for x in st.session_state['prog_rules_df']['Category'].unique() if str(x).strip() != ""])
+            existing_subcats = [""] + sorted([str(x) for x in st.session_state['prog_rules_df']['Sub-Category'].unique() if str(x).strip() != ""])
+            
+            p_title = st.text_input("Program Title (Required)*")
+            
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                p_cat_sel = st.selectbox("Category (Select Existing)", existing_cats)
+                p_cat_new = st.text_input("...or Type New Category")
+            with c2:
+                p_sub_sel = st.selectbox("Sub-Category (Select Existing)", existing_subcats)
+                p_sub_new = st.text_input("...or Type New Sub-Category")
+            with c3:
+                p_acrro = st.selectbox("ACRRO Category (HQ List)", acrro_options)
+
+            if st.form_submit_button("Add to Central List"):
+                final_cat = p_cat_new.strip() if p_cat_new.strip() != "" else p_cat_sel
+                final_sub = p_sub_new.strip() if p_sub_new.strip() != "" else p_sub_sel
+                
+                if not p_title.strip() or not final_cat:
+                    st.error("Program Title and Category are required!")
+                else:
+                    new_row = pd.DataFrame([{
+                        "Program Title": p_title.strip(),
+                        "Category": final_cat,
+                        "Sub-Category": final_sub,
+                        "ACRRO Category": p_acrro,
+                        "Status": "Active" 
+                    }])
+                    st.session_state['prog_rules_df'] = pd.concat([st.session_state['prog_rules_df'], new_row], ignore_index=True)
+                    st.success(f"Added '{p_title}'!")
+                    st.experimental_rerun()
+
+        st.markdown("#### 📋 Central Program List")
+        st.info("Set older programs to 'Inactive' to hide them from the Tracker dropdown while preserving their historical data. Changes save automatically!")
+        
+        st.session_state['prog_rules_df'] = st.data_editor(
+            st.session_state['prog_rules_df'],
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "Program Title": st.column_config.TextColumn(required=True),
+                "Category": st.column_config.TextColumn(required=True),
+                "Sub-Category": st.column_config.TextColumn(),
+                "ACRRO Category": st.column_config.SelectboxColumn(options=acrro_options),
+                "Status": st.column_config.SelectboxColumn(options=["Active", "Inactive"], required=True, default="Active")
+            }
+        )
+
+        if not st.session_state['prog_rules_df'].empty:
+            csv_prog = st.session_state['prog_rules_df'].to_csv(index=False).encode('utf-8')
+            st.download_button("💾 Download Program Rules", data=csv_prog, file_name="program_definitions.csv", mime="text/csv")
+
+    elif prog_tab == "📅 Tracker":
+        st.subheader("Log a Program")
+        
+        # Check if any programs are defined, and filter for only Active ones
+        active_programs_df = st.session_state['prog_rules_df'][st.session_state['prog_rules_df']['Status'] != 'Inactive']
+        defined_programs = active_programs_df['Program Title'].dropna().unique().tolist()
+        
+        if st.session_state['prog_rules_df'].empty:
+            st.warning("You need to define at least one program in the 'Program Definitions' tab before you can track an event.")
+        elif not defined_programs:
+            st.warning("All of your defined programs are currently set to 'Inactive'. Set at least one to 'Active' to log an event.")
+        else:
+            with st.form("log_event_form", clear_on_submit=True):
+                st.markdown("**Basic Information**")
+                bc1, bc2, bc3, bc4 = st.columns(4)
+                with bc1:
+                    t_prog = st.selectbox("Program*", [""] + defined_programs)
+                with bc2:
+                    t_date = st.date_input("Date*")
+                with bc3:
+                    t_length = st.number_input("Length (Days)*", min_value=1, value=1, step=1)
+                with bc4:
+                    t_total_part = st.number_input("Total Participants*", min_value=0, value=0, step=1)
+                
+                with st.expander("Advanced Tracking Fields (Optional)", expanded=False):
+                    st.markdown("**Participant Demographics**")
+                    dc1, dc2, dc3, dc4, dc5 = st.columns(5)
+                    with dc1: t_toddler = st.number_input("Toddler/Infant", min_value=0, value=0, step=1)
+                    with dc2: t_preschool = st.number_input("Preschool", min_value=0, value=0, step=1)
+                    with dc3: t_school = st.number_input("School Age", min_value=0, value=0, step=1)
+                    with dc4: t_teen = st.number_input("Teen", min_value=0, value=0, step=1)
+                    with dc5: t_adult = st.number_input("Adult", min_value=0, value=0, step=1)
+                    
+                    st.divider()
+                    st.markdown("**Financials & Operations**")
+                    fc1, fc2, fc3, fc4 = st.columns(4)
+                    with fc1: t_cost = st.number_input("Cost ($)", min_value=0.0, value=0.0, step=10.0)
+                    with fc2: t_income = st.number_input("Income ($)", min_value=0.0, value=0.0, step=10.0)
+                    with fc3: t_duration = st.number_input("Duration (Hours)", min_value=0.0, value=0.0, step=0.5)
+                    with fc4: t_planning = st.number_input("Planning (Hours)", min_value=0.0, value=0.0, step=0.5)
+                    
+                    sc1, sc2 = st.columns(2)
+                    with sc1: t_staff = st.number_input("Staffing Used", min_value=0, value=1, step=1)
+                    with sc2: t_volunteers = st.number_input("Volunteers", min_value=0, value=0, step=1)
+                    
+                    t_notes = st.text_area("Notes", height=100)
+
+                if st.form_submit_button("Log Event"):
+                    if not t_prog:
+                        st.error("Please select a Program from the list.")
+                    else:
+                        new_log = pd.DataFrame([{
+                            "Program": t_prog, "Date": t_date, "Length (Days)": t_length, "Total Participants": t_total_part,
+                            "Participants - Toddler/Infant": t_toddler, "Participants - Preschool": t_preschool,
+                            "Participants - School Age": t_school, "Participants - Teen": t_teen,
+                            "Participants - Adult": t_adult, "Cost": t_cost, "Income": t_income, 
+                            "Staffing Used": t_staff, "Planning (Hours)": t_planning, 
+                            "Duration (Hours)": t_duration, "Volunteers": t_volunteers, "Notes": t_notes
+                        }])
+                        st.session_state['tracker_df'] = pd.concat([st.session_state['tracker_df'], new_log], ignore_index=True)
+                        st.success(f"Successfully logged '{t_prog}' on {t_date}!")
+                        st.experimental_rerun()
+
+        # --- Display Tracker Data ---
+        st.divider()
+        st.subheader("Logged Events")
+        
+        up_tracker = st.file_uploader("📂 Load Saved Tracker Data (CSV)", type=['csv'], key="tracker_uploader")
+        if up_tracker and st.session_state.get('last_up_tracker') != up_tracker.name:
+            imp_tracker_df = pd.read_csv(up_tracker)
+            for c in st.session_state['tracker_df'].columns:
+                if c not in imp_tracker_df.columns: imp_tracker_df[c] = ""
+            
+            st.session_state['tracker_df'] = imp_tracker_df[st.session_state['tracker_df'].columns]
+            st.session_state['last_up_tracker'] = up_tracker.name
+            st.success("Loaded saved tracker data! This has overridden the Central Workspace tracker data.")
+            st.experimental_rerun()
+            
+        st.info("Edit or delete logs directly in the table below. Changes auto-save instantly.")
+        
+        st.session_state['tracker_df'] = st.data_editor(
+            st.session_state['tracker_df'],
+            num_rows="dynamic",
+            use_container_width=True
+        )
+
+        if not st.session_state['tracker_df'].empty:
+            csv_tracker = st.session_state['tracker_df'].to_csv(index=False).encode('utf-8')
+            st.download_button("💾 Download Tracker Data", data=csv_tracker, file_name="program_tracker_log.csv", mime="text/csv")
+
+    elif prog_tab == "📊 Basic Insights":
+        st.subheader("Basic Programming Insights")
+
+        if st.session_state['tracker_df'].empty or st.session_state['prog_rules_df'].empty:
+            st.info("Log some programs in the Tracker and ensure your Program Definitions are set up to see insights here.")
+        else:
+            # --- 1. PREP THE DATA ---
+            df = st.session_state['tracker_df'].copy()
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            df = df.dropna(subset=['Date'])
+            df['Total Participants'] = pd.to_numeric(df['Total Participants'], errors='coerce').fillna(0)
+
+            # Date Math & Grouping Helpers
+            df['FY'] = df['Date'].dt.year + (df['Date'].dt.month >= 10).astype(int)
+            
+            def get_fy_quarter(dt):
+                if dt.month in [10, 11, 12]: return "Q1"
+                elif dt.month in [1, 2, 3]: return "Q2"
+                elif dt.month in [4, 5, 6]: return "Q3"
+                else: return "Q4"
+                
+            df['Quarter'] = df['Date'].apply(get_fy_quarter)
+            df['FY_Quarter_Label'] = "FY" + df['FY'].astype(str) + " " + df['Quarter']
+            df['Month_Year'] = df['Date'].dt.strftime('%b %Y')
+            df['YearMonth_Sort'] = df['Date'].dt.strftime('%Y-%m') # Hidden column for proper sorting
+
+            # Merge with Program Definitions
+            rules_df = st.session_state['prog_rules_df'].copy()
+            df = pd.merge(df, rules_df, left_on='Program', right_on='Program Title', how='left')
+            df['ACRRO Category'] = df['ACRRO Category'].fillna('Uncategorized')
+            df['Category'] = df['Category'].fillna('Uncategorized')
+
+            # --- 2. DYNAMIC FILTERS ---
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                prog_options = ["All Programs Combined"] + sorted(df['Program'].unique().tolist())
+                selected_prog = st.selectbox("Select Program", prog_options)
+            
+            with c2:
+                time_view = st.selectbox("View Resolution", ["Lifetime (Quarterly)", "Fiscal Year", "Single Quarter", "Single Month"], index=1)
+                
+            with c3:
+                # Dynamically populate the third dropdown based on the resolution chosen
+                if time_view == "Lifetime (Quarterly)":
+                    st.markdown("<div style='padding-top:2.2rem; color:gray;'><i>Viewing All Logged Data</i></div>", unsafe_allow_html=True)
+                    selected_time = "All"
+                elif time_view == "Fiscal Year":
+                    available_fys = sorted(df['FY'].unique().tolist(), reverse=True)
+                    current_year = datetime.now().year
+                    current_fy = current_year + 1 if datetime.now().month >= 10 else current_year
+                    if not available_fys: available_fys = [current_fy]
+                    default_fy = available_fys.index(current_fy) if current_fy in available_fys else 0
+                    selected_time = st.selectbox("Select FY", available_fys, index=default_fy)
+                elif time_view == "Single Quarter":
+                    available_qs = sorted(df['FY_Quarter_Label'].unique().tolist(), reverse=True)
+                    selected_time = st.selectbox("Select Quarter", available_qs if available_qs else ["N/A"])
+                elif time_view == "Single Month":
+                    # Sort months chronologically by using our hidden YearMonth sort column
+                    month_mapping = df[['Month_Year', 'YearMonth_Sort']].drop_duplicates().sort_values('YearMonth_Sort', ascending=False)
+                    available_months = month_mapping['Month_Year'].tolist()
+                    selected_time = st.selectbox("Select Month", available_months if available_months else ["N/A"])
+
+            # Apply Filters
+            filtered_df = df.copy()
+            if selected_prog != "All Programs Combined":
+                filtered_df = filtered_df[filtered_df['Program'] == selected_prog]
+                
+            if time_view == "Fiscal Year":
+                filtered_df = filtered_df[filtered_df['FY'] == selected_time]
+            elif time_view == "Single Quarter":
+                filtered_df = filtered_df[filtered_df['FY_Quarter_Label'] == selected_time]
+            elif time_view == "Single Month":
+                filtered_df = filtered_df[filtered_df['Month_Year'] == selected_time]
+
+            st.divider()
+
+            if filtered_df.empty:
+                st.warning(f"No data found for the selected filters.")
+            else:
+            # --- 3. HIGH-LEVEL KPI CARDS ---
+                total_events = len(filtered_df)
+                total_attendance = filtered_df['Total Participants'].sum()
+                avg_attendance = total_attendance / total_events if total_events > 0 else 0
+                
+                asip = st.session_state.get('asip_pop', 0)
+                part_per_capita = total_attendance / asip if asip > 0 else 0
+                
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Total Events Hosted", f"{total_events:,.0f}")
+                k2.metric("Total Participants", f"{total_attendance:,.0f}")
+                k3.metric("Avg. Attendance per Event", f"{avg_attendance:,.1f}")
+                k4.metric("Participation per Capita", f"{part_per_capita:.3f}" if asip > 0 else "N/A")
+                st.divider()
+
+            # --- 4. DYNAMIC TREND CHART ---
+                if time_view == "Lifetime (Quarterly)":
+                    agg_df = filtered_df.groupby('FY_Quarter_Label')['Total Participants'].sum().reset_index()
+                    agg_df = agg_df.sort_values('FY_Quarter_Label')
+                    fig_line = px.line(
+                        agg_df, x='FY_Quarter_Label', y='Total Participants', markers=True, 
+                        title="Lifetime Participation (by Quarter)",
+                        labels={'FY_Quarter_Label': 'Fiscal Quarter'} 
+                    )
+                    fig_line.update_traces(line=dict(width=4))
+
+                elif time_view == "Fiscal Year":
+                    months_order = ['Oct', 'Nov', 'Dec', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep']
+                    filtered_df['Month_Short'] = filtered_df['Date'].dt.strftime('%b')
+                    agg_df = filtered_df.groupby('Month_Short')['Total Participants'].sum().reindex(months_order, fill_value=0).reset_index()
+                    
+                    q1_tot = agg_df.iloc[0:3]['Total Participants'].sum()
+                    q2_tot = agg_df.iloc[3:6]['Total Participants'].sum()
+                    q3_tot = agg_df.iloc[6:9]['Total Participants'].sum()
+                    q4_tot = agg_df.iloc[9:12]['Total Participants'].sum()
+
+                    fig_line = px.line(agg_df, x='Month_Short', y='Total Participants', markers=True, title=f"Participation Trend (FY{selected_time})")
+                    
+                    fig_line.add_vrect(x0=-0.5, x1=2.5, fillcolor="rgba(173, 216, 230, 0.2)", layer="below", line_width=0, annotation_text=f"<b>Q1</b><br>Tot: {q1_tot:,.0f}", annotation_position="top left")
+                    fig_line.add_vrect(x0=2.5, x1=5.5, fillcolor="rgba(144, 238, 144, 0.2)", layer="below", line_width=0, annotation_text=f"<b>Q2</b><br>Tot: {q2_tot:,.0f}", annotation_position="top left")
+                    fig_line.add_vrect(x0=5.5, x1=8.5, fillcolor="rgba(255, 255, 224, 0.2)", layer="below", line_width=0, annotation_text=f"<b>Q3</b><br>Tot: {q3_tot:,.0f}", annotation_position="top left")
+                    fig_line.add_vrect(x0=8.5, x1=11.5, fillcolor="rgba(255, 182, 193, 0.2)", layer="below", line_width=0, annotation_text=f"<b>Q4</b><br>Tot: {q4_tot:,.0f}", annotation_position="top left")
+                    fig_line.update_traces(line=dict(width=4))
+
+                elif time_view == "Single Quarter":
+                    filtered_df['Date_Str'] = filtered_df['Date'].dt.strftime('%Y-%m-%d')
+                    agg_df = filtered_df.groupby('Date_Str')['Total Participants'].sum().reset_index().sort_values('Date_Str')
+                    fig_line = px.line(agg_df, x='Date_Str', y='Total Participants', markers=True, title=f"Daily Participation ({selected_time})")
+                    fig_line.update_traces(line=dict(width=3))
+                    
+                    # Calculate the exact start and end dates of the selected fiscal quarter
+                    fy_str, q_str = selected_time.split(' ')
+                    fy_year = int(fy_str.replace('FY', ''))
+                    
+                    if q_str == 'Q1': start_d, end_d = f"{fy_year-1}-10-01", f"{fy_year-1}-12-31"
+                    elif q_str == 'Q2': start_d, end_d = f"{fy_year}-01-01", f"{fy_year}-03-31"
+                    elif q_str == 'Q3': start_d, end_d = f"{fy_year}-04-01", f"{fy_year}-06-30"
+                    elif q_str == 'Q4': start_d, end_d = f"{fy_year}-07-01", f"{fy_year}-09-30"
+                    
+                    # Lock the X-Axis to the 3-month span
+                    fig_line.update_xaxes(title="Date", range=[start_d, end_d])
+
+                elif time_view == "Single Month":
+                    filtered_df['Date_Str'] = filtered_df['Date'].dt.strftime('%Y-%m-%d')
+                    agg_df = filtered_df.groupby('Date_Str')['Total Participants'].sum().reset_index().sort_values('Date_Str')
+                    fig_line = px.line(agg_df, x='Date_Str', y='Total Participants', markers=True, title=f"Daily Participation ({selected_time})")
+                    fig_line.update_traces(line=dict(width=3))
+                    
+                    # Calculate the exact first and last day of the selected month
+                    start_d = pd.to_datetime(selected_time, format='%b %Y')
+                    end_d = start_d + pd.offsets.MonthEnd(1)
+                    
+                    # Lock the X-axis and force daily tick marks (86,400,000 milliseconds = 1 day)
+                    fig_line.update_xaxes(
+                        title="Date", 
+                        range=[start_d.strftime('%Y-%m-%d'), end_d.strftime('%Y-%m-%d')],
+                        dtick=86400000 
+                    )
+
+                fig_line.update_yaxes(rangemode="tozero")
+                st.plotly_chart(fig_line, use_container_width=True)
+                st.divider()
+
+                # --- 5. DAY OF WEEK & CATEGORY BREAKDOWN ---
+                c1, c2 = st.columns(2)
+                
+                with c1:
+                    days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+                    filtered_df['Day of Week'] = filtered_df['Date'].dt.day_name()
+                    dow_agg = filtered_df.groupby('Day of Week')['Total Participants'].mean().reindex(days_order, fill_value=0).reset_index()
+                    
+                    fig_dow = px.bar(
+                        dow_agg, x='Day of Week', y='Total Participants',
+                        title="Average Attendance by Day of Week",
+                        labels={'Total Participants': 'Avg. Participants'},
+                        color_discrete_sequence=['#3498DB']
+                    )
+                    fig_dow.update_layout(xaxis_title=None)
+                    st.plotly_chart(fig_dow, use_container_width=True)
+
+                with c2:
+                    if selected_prog == "All Programs Combined":
+                        # Clean up blank sub-categories for the legend
+                        filtered_df['Sub-Category_Clean'] = filtered_df['Sub-Category'].replace('', 'General/Unspecified')
+                        
+                        # Group by Category and Sub-Category
+                        cat_agg = filtered_df.groupby(['Category', 'Sub-Category_Clean'])['Total Participants'].sum().reset_index()
+                        cat_agg = cat_agg[cat_agg['Total Participants'] > 0]
+                        
+                        # Sort so the largest overall category sits at the top
+                        cat_totals = cat_agg.groupby('Category')['Total Participants'].transform('sum')
+                        cat_agg['Cat_Total'] = cat_totals
+                        cat_agg = cat_agg.sort_values(['Cat_Total', 'Category'], ascending=[True, True])
+                        
+                        fig_user_cat = px.bar(
+                            cat_agg, x='Total Participants', y='Category', color='Sub-Category_Clean', orientation='h',
+                            title="Total Attendance by Category",
+                            color_discrete_sequence=px.colors.qualitative.Pastel
+                        )
+                        fig_user_cat.update_layout(yaxis_title=None, legend_title_text='Sub-Category')
+                        st.plotly_chart(fig_user_cat, use_container_width=True)
+                    else:
+                        st.info("Category breakdowns are only visible when 'All Programs Combined' is selected.")
+
+                # --- 6. ACRRO CATEGORY BREAKDOWN ---
+                if selected_prog == "All Programs Combined":
+                    st.divider()
+                    acrro_agg = filtered_df.groupby('ACRRO Category')['Total Participants'].sum().reset_index().sort_values('Total Participants', ascending=True)
+                    acrro_agg = acrro_agg[acrro_agg['Total Participants'] > 0]
+                    
+                    fig_acrro = px.bar(
+                        acrro_agg, x='Total Participants', y='ACRRO Category', orientation='h',
+                        title="Total Attendance by ACRRO Category",
+                        color_discrete_sequence=['#2ECC71']
+                    )
+                    fig_acrro.update_layout(yaxis_title=None)
+                    st.plotly_chart(fig_acrro, use_container_width=True)
+
+    elif prog_tab == "🚀 Advanced Insights":
+        st.subheader("Advanced Demographics & Operational Efficiency")
+
+        if st.session_state['tracker_df'].empty or st.session_state['prog_rules_df'].empty:
+            st.info("Log some programs with 'Advanced Fields' enabled in the Tracker to see deep-dive insights.")
+        else:
+            # --- 1. PREP THE DATA ---
+            df = st.session_state['tracker_df'].copy()
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            df = df.dropna(subset=['Date'])
+            
+            # Force all advanced fields to be numeric
+            num_cols = [
+                "Total Participants", "Participants - Toddler/Infant", "Participants - Preschool", 
+                "Participants - School Age", "Participants - Teen", "Participants - Adult", 
+                "Cost", "Income", "Staffing Used", "Planning (Hours)", "Duration (Hours)", "Volunteers"
+            ]
+            for col in num_cols:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+            # Date Math & Merging
+            df['FY'] = df['Date'].dt.year + (df['Date'].dt.month >= 10).astype(int)
+            rules_df = st.session_state['prog_rules_df'].copy()
+            df = pd.merge(df, rules_df, left_on='Program', right_on='Program Title', how='left')
+            df['Category'] = df['Category'].fillna('Uncategorized')
+
+            # --- 2. FILTERS (Mirrored from Basic Insights) ---
+            c1, c2 = st.columns(2)
+            with c1:
+                prog_options = ["All Programs Combined"] + sorted(df['Program'].unique().tolist())
+                selected_prog = st.selectbox("Select Program", prog_options)
+            with c2:
+                available_fys = sorted(df['FY'].unique().tolist(), reverse=True)
+                current_fy = datetime.now().year + 1 if datetime.now().month >= 10 else datetime.now().year
+                if not available_fys: available_fys = [current_fy]
+                default_fy = available_fys.index(current_fy) if current_fy in available_fys else 0
+                selected_fy = st.selectbox("Select Fiscal Year", available_fys, index=default_fy)
+
+            # Apply Filters
+            filtered_df = df[df['FY'] == selected_fy].copy()
+            if selected_prog != "All Programs Combined":
+                filtered_df = filtered_df[filtered_df['Program'] == selected_prog]
+
+            st.divider()
+
+            if filtered_df.empty or filtered_df['Total Participants'].sum() == 0:
+                st.warning(f"No participant data found for the selected filters in FY{selected_fy}.")
+            else:
+                
+                # ==========================================
+                # SECTION A: DEMOGRAPHICS
+                # ==========================================
+                st.markdown("### 📊 Age Demographics")
+                
+                demo_cols = ["Participants - Toddler/Infant", "Participants - Preschool", 
+                             "Participants - School Age", "Participants - Teen", "Participants - Adult"]
+                
+                # Check if demographics were actually logged
+                if filtered_df[demo_cols].sum().sum() == 0:
+                    st.info("No age demographic breakdowns were logged for these programs.")
+                else:
+                    d1, d2 = st.columns([1, 2])
+                    
+                    with d1:
+                        # Overall Demographic Donut Chart
+                        demo_sums = filtered_df[demo_cols].sum().reset_index()
+                        demo_sums.columns = ['Age Group', 'Count']
+                        demo_sums['Age Group'] = demo_sums['Age Group'].str.replace('Participants - ', '')
+                        demo_sums = demo_sums[demo_sums['Count'] > 0]
+                        
+                        fig_demo_pie = px.pie(
+                            demo_sums, names='Age Group', values='Count', hole=0.4,
+                            title="Overall Audience Breakdown",
+                            color_discrete_sequence=px.colors.qualitative.Vivid
+                        )
+                        fig_demo_pie.update_traces(textposition='inside', textinfo='percent+label')
+                        st.plotly_chart(fig_demo_pie, use_container_width=True)
+
+                    with d2:
+                        # 100% Normalized Stacked Bar by Category (Who is attending what?)
+                        if selected_prog == "All Programs Combined":
+                            demo_cat = filtered_df.groupby('Category')[demo_cols].sum().reset_index()
+                            demo_melt = demo_cat.melt(id_vars='Category', value_vars=demo_cols, var_name='Age Group', value_name='Count')
+                            demo_melt['Age Group'] = demo_melt['Age Group'].str.replace('Participants - ', '')
+                            demo_melt = demo_melt[demo_melt['Count'] > 0]
+                            
+                            fig_demo_bar = px.bar(
+                                demo_melt, x='Count', y='Category', color='Age Group', orientation='h',
+                                title="Demographic Reach by Category (100% Normalized)",
+                                color_discrete_sequence=px.colors.qualitative.Vivid,
+                                barmode='100%'
+                            )
+                            fig_demo_bar.update_layout(xaxis_title="Percentage of Audience", yaxis_title=None)
+                            st.plotly_chart(fig_demo_bar, use_container_width=True)
+                        else:
+                            st.info("Category breakdown is only visible when 'All Programs Combined' is selected.")
+
+                st.divider()
+
+                # ==========================================
+                # SECTION B: FINANCIALS
+                # ==========================================
+                st.markdown("### 💰 Financial Efficiency")
+                
+                total_cost = filtered_df['Cost'].sum()
+                total_income = filtered_df['Income'].sum()
+                total_participants = filtered_df['Total Participants'].sum()
+                cost_per_part = total_cost / total_participants if total_participants > 0 else 0
+                net_cost = total_cost - total_income
+                
+                f1, f2, f3, f4 = st.columns(4)
+                f1.metric("Total Program Costs", f"${total_cost:,.2f}")
+                f2.metric("Total Income/Grants", f"${total_income:,.2f}")
+                f3.metric("Net Cost to Library", f"${net_cost:,.2f}")
+                
+                # Color code Cost Per Participant (Red if over $10/head)
+                cpp_color = "#E74C3C" if cost_per_part > 10 else "#2ECC71"
+                st.markdown(f"""
+                    <style>
+                        div[data-testid="column"]:nth-of-type(4) [data-testid="stMetricValue"] {{ color: {cpp_color} !important; }}
+                    </style>
+                """, unsafe_allow_html=True)
+                f4.metric("Cost per Participant", f"${cost_per_part:,.2f}")
+
+                if selected_prog == "All Programs Combined" and total_cost > 0:
+                    fin_cat = filtered_df.groupby('Category').agg({'Cost': 'sum', 'Total Participants': 'sum'}).reset_index()
+                    fin_cat['Cost per Participant'] = fin_cat['Cost'] / fin_cat['Total Participants']
+                    fin_cat = fin_cat[fin_cat['Cost'] > 0].sort_values('Cost per Participant', ascending=False)
+                    
+                    fig_fin = px.bar(
+                        fin_cat, x='Cost per Participant', y='Category', orientation='h',
+                        title="Average Cost per Participant by Category",
+                        text_auto='.2f', color_discrete_sequence=['#F1C40F']
+                    )
+                    fig_fin.update_layout(xaxis_title="Cost ($)", yaxis_title=None)
+                    st.plotly_chart(fig_fin, use_container_width=True)
+
+                st.divider()
+
+                # ==========================================
+                # SECTION C: OPERATIONS & STAFFING
+                # ==========================================
+                st.markdown("### ⚙️ Operational Leverage")
+                
+                total_duration = filtered_df['Duration (Hours)'].sum()
+                total_planning = filtered_df['Planning (Hours)'].sum()
+                total_staff_used = filtered_df['Staffing Used'].sum()
+                total_volunteers = filtered_df['Volunteers'].sum()
+                
+                # The "Planning Ratio" - How many hours of prep go into 1 hour of programming?
+                planning_ratio = total_planning / total_duration if total_duration > 0 else 0
+                
+                # Leverage - How many people does 1 staff member serve?
+                leverage = total_participants / total_staff_used if total_staff_used > 0 else 0
+
+                o1, o2, o3, o4 = st.columns(4)
+                o1.metric("Live Execution (Hours)", f"{total_duration:,.1f}")
+                o2.metric("Behind-the-Scenes Prep (Hours)", f"{total_planning:,.1f}")
+                o3.metric("Prep-to-Live Ratio", f"{planning_ratio:.1f}x", help="Hours spent planning for every 1 hour of live programming.")
+                o4.metric("Staff Leverage", f"{leverage:.1f}", help="Average number of participants served per staff member deployed.")
+                
+                if selected_prog == "All Programs Combined" and (total_duration > 0 or total_planning > 0):
+                    time_cat = filtered_df.groupby('Category')[['Duration (Hours)', 'Planning (Hours)']].sum().reset_index()
+                    time_melt = time_cat.melt(id_vars='Category', value_vars=['Duration (Hours)', 'Planning (Hours)'], var_name='Time Type', value_name='Hours')
+                    time_melt = time_melt[time_melt['Hours'] > 0]
+                    
+                    fig_time = px.bar(
+                        time_melt, x='Category', y='Hours', color='Time Type', barmode='group',
+                        title="Planning vs. Execution Time by Category",
+                        color_discrete_map={'Duration (Hours)': '#2ECC71', 'Planning (Hours)': '#95A5A6'}
+                    )
+                    fig_time.update_layout(xaxis_title=None)
+                    st.plotly_chart(fig_time, use_container_width=True)
+
+# ==========================================
+# TAB 4: PATRONS
+# ==========================================
+elif active_tab == "👥 Patrons":
+    
+    pat_tab = st.radio("Patron Views", ["📝 Demographic Data", "📊 Patron Insights"], horizontal=True)
+    st.divider()
+    
+    # Official Category Options
+    cat_options = [
+        "Active Duty", "Civilian", "Computer Only", "Contractor", "Dependent (Other)", 
+        "DIGITAL-ONLINE", "Foreign Military", "Interlibrary Loan", "National Guard", 
+        "Other", "Reservist", "Retired", "Spouse", "Student", "Library Staff", 
+        "Library System Acct", "Unknown"
+    ]
+    
+    # Official Branch Options
+    branch_options = [
+        "00 Department of Defense", "01 US Air Force", "02 US Army", "03 US Marine Corps", 
+        "04 US Navy", "05 US Space Force", "06 US Coast Guard", "07 Office of SecDef", 
+        "08 AAFES Local National", "08a NATO", "09 Department of State", "10 Foreign Air Force", 
+        "11 Foreign Army", "12 Foreign Navy", "13 Foreign Marines", "14 Foreign Coast Guard", 
+        "15 Public Health Service", "16 Nat Oceanic Atmospheric Admn", "17 Other", "18 Unknown"
+    ]
+    
+    # Translation Maps for SQL Uploads
+    cat_map = {
+        'CIV': 'Civilian', 'COMP': 'Computer Only', 'CON': 'Contractor', 'DEP': 'Dependent (Other)',
+        'DIG': 'DIGITAL-ONLINE', 'FGN-MIL': 'Foreign Military', 'ILL': 'Interlibrary Loan', 
+        'MIL': 'Active Duty', 'NG': 'National Guard', 'OTHER': 'Other', 'RES': 'Reservist', 
+        'RET': 'Retired', 'SPOUSE': 'Spouse', 'STU': 'Student', 'S': 'Library Staff', 
+        'SIP2': 'Library System Acct', 'UNKNOWN': 'Unknown'
+    }
+    
+    branch_map = {
+        'DOD': '00 Department of Defense', 'DOS': '09 Department of State', 'FAF': '10 Foreign Air Force',
+        'FARMY': '11 Foreign Army', 'FCG': '14 Foreign Coast Guard', 'FMC': '13 Foreign Marines',
+        'FNAVY': '12 Foreign Navy', 'LN': '08 AAFES Local National', 'NATO': '08a NATO',
+        'NOAA': '16 Nat Oceanic Atmospheric Admn', 'OSD': '07 Office of SecDef', 'OTHER': '17 Other',
+        'PHS': '15 Public Health Service', 'UNKWN': '18 Unknown', 'USA': '02 US Army', 
+        'USAF': '01 US Air Force', 'USCG': '06 US Coast Guard', 'USMC': '03 US Marine Corps', 
+        'USN': '04 US Navy', 'USSF': '05 US Space Force'
+    }
+
+    if pat_tab == "📝 Demographic Data":
+        st.subheader("Patron Demographics Entry")
+        st.info("Log your patron counts manually using the form below, or upload a CSV report. The app will automatically calculate your Total Patrons based on these entries.")
+        
+        # Bulk Uploader
+        up_patron = st.file_uploader("📂 Bulk Upload Patron Report (CSV)", type=['csv'], key="patron_uploader")
+        if up_patron and st.session_state.get('last_up_patron') != up_patron.name:
+            imp_pat_df = pd.read_csv(up_patron)
+            
+            # Clean and translate raw SQL codes if present
+            if 'Patron Category' in imp_pat_df.columns:
+                imp_pat_df['Patron Category'] = imp_pat_df['Patron Category'].replace(cat_map)
+            if 'Service Branch' in imp_pat_df.columns:
+                imp_pat_df['Service Branch'] = imp_pat_df['Service Branch'].replace(branch_map)
+                
+            for c in st.session_state['patron_df'].columns:
+                if c not in imp_pat_df.columns: imp_pat_df[c] = ""
+            
+            imp_pat_df['Count'] = pd.to_numeric(imp_pat_df['Count'], errors='coerce').fillna(0)
+            
+            st.session_state['patron_df'] = imp_pat_df[st.session_state['patron_df'].columns]
+            st.session_state['last_up_patron'] = up_patron.name
+            st.success("Loaded and translated patron report!")
+            st.experimental_rerun()
+            
+        # Manual Entry Form
+        with st.form("add_patron_form", clear_on_submit=True):
+            st.markdown("**Add a Demographic Group**")
+            p1, p2, p3 = st.columns([2, 2, 1])
+            with p1: entry_cat = st.selectbox("Patron Category", cat_options)
+            with p2: entry_branch = st.selectbox("Service Branch", branch_options)
+            with p3: entry_count = st.number_input("Count", min_value=0, value=0, step=1)
+            
+            if st.form_submit_button("Add to Central List"):
+                if entry_count > 0:
+                    new_row = pd.DataFrame([{"Patron Category": entry_cat, "Service Branch": entry_branch, "Count": entry_count}])
+                    st.session_state['patron_df'] = pd.concat([st.session_state['patron_df'], new_row], ignore_index=True)
+                    st.success("Group added!")
+                    st.experimental_rerun()
+                else:
+                    st.warning("Count must be greater than 0.")
+
+        st.divider()
+        st.markdown("#### 📋 Patron Central List")
+        st.session_state['patron_df'] = st.data_editor(
+            st.session_state['patron_df'],
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "Patron Category": st.column_config.SelectboxColumn(options=cat_options, required=True),
+                "Service Branch": st.column_config.SelectboxColumn(options=branch_options, required=True),
+                "Count": st.column_config.NumberColumn(required=True, min_value=0)
+            }
+        )
+
+        if not st.session_state['patron_df'].empty:
+            csv_patron = st.session_state['patron_df'].to_csv(index=False).encode('utf-8')
+            st.download_button("💾 Download Patron Data (CSV)", data=csv_patron, file_name="patron_composition.csv", mime="text/csv")
+
+    elif pat_tab == "📊 Patron Insights":
+        st.subheader("Community Reach & Demographics")
+        
+        df = st.session_state['patron_df'].copy()
+        df['Count'] = pd.to_numeric(df['Count'], errors='coerce').fillna(0)
+        
+        total_patrons = df['Count'].sum()
+        asip = st.session_state.get('asip_pop', 0)
+        reach = (total_patrons / asip) if asip > 0 else 0
+        
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Total Registered Patrons", f"{total_patrons:,.0f}")
+        p2.metric("ASIP Population", f"{asip:,.0f}")
+        p3.metric("Community Reach", f"{reach:.1%}" if asip > 0 else "N/A")
+        
+        reach_color = "#2ECC71" if reach >= 0.50 else "#F39C12" if reach >= 0.30 else "#E74C3C"
+        st.markdown(f"""<style>div[data-testid="column"]:nth-of-type(3) [data-testid="stMetricValue"] {{ color: {reach_color} !important; }}</style>""", unsafe_allow_html=True)
+        
+        st.divider()
+        
+        if df.empty or total_patrons == 0:
+            st.info("Log your patron demographics in the 'Demographic Data' tab to unlock visual insights.")
+        else:
+            c1, c2 = st.columns(2)
+            
+            with c1:
+                # Category Breakdown
+                cat_df = df.groupby('Patron Category')['Count'].sum().reset_index()
+                cat_df = cat_df[cat_df['Count'] > 0].sort_values('Count', ascending=True)
+                fig_cat = px.bar(
+                    cat_df, x='Count', y='Patron Category', orientation='h',
+                    title="Patrons by Category",
+                    color_discrete_sequence=['#3498DB']
+                )
+                fig_cat.update_layout(yaxis_title=None)
+                st.plotly_chart(fig_cat, use_container_width=True)
+                
+            with c2:
+                # Branch Breakdown
+                branch_df = df.groupby('Service Branch')['Count'].sum().reset_index()
+                branch_df = branch_df[branch_df['Count'] > 0].sort_values('Count', ascending=True)
+                fig_branch = px.bar(
+                    branch_df, x='Count', y='Service Branch', orientation='h',
+                    title="Patrons by Service Branch",
+                    color_discrete_sequence=['#9B59B6']
+                )
+                fig_branch.update_layout(yaxis_title=None)
+                st.plotly_chart(fig_branch, use_container_width=True)
+
+                # --- INTERACTIVE DRILL-DOWN CHARTS ---
+            st.divider()
+            st.markdown("#### Drill-Down Demographics")
+            
+            c3, c4 = st.columns(2)
+            
+            with c3:
+                # Pie 1: Select Category -> See Branches
+                available_cats = sorted(df[df['Count'] > 0]['Patron Category'].unique().tolist())
+                if available_cats:
+                    selected_cat = st.selectbox("Filter by Patron Category", available_cats)
+                    pie1_df = df[df['Patron Category'] == selected_cat].copy()
+                    pie1_df = pie1_df[pie1_df['Count'] > 0]
+                    
+                    if not pie1_df.empty:
+                        fig_pie1 = px.pie(
+                            pie1_df, names='Service Branch', values='Count', 
+                            title=f"Service Branch Breakdown: {selected_cat}",
+                            hole=0.4,
+                            color_discrete_sequence=px.colors.qualitative.Pastel
+                        )
+                        fig_pie1.update_traces(textposition='inside', textinfo='percent+label')
+                        st.plotly_chart(fig_pie1, use_container_width=True)
+                    else:
+                        st.info(f"No branch data found for {selected_cat}.")
+                else:
+                    st.info("No category data available.")
+                    
+            with c4:
+                # Pie 2: Select Branch -> See Categories
+                available_branches = sorted(df[df['Count'] > 0]['Service Branch'].unique().tolist())
+                if available_branches:
+                    selected_branch = st.selectbox("Filter by Service Branch", available_branches)
+                    pie2_df = df[df['Service Branch'] == selected_branch].copy()
+                    pie2_df = pie2_df[pie2_df['Count'] > 0]
+                    
+                    if not pie2_df.empty:
+                        fig_pie2 = px.pie(
+                            pie2_df, names='Patron Category', values='Count', 
+                            title=f"Category Breakdown: {selected_branch}",
+                            hole=0.4,
+                            color_discrete_sequence=px.colors.qualitative.Set2
+                        )
+                        fig_pie2.update_traces(textposition='inside', textinfo='percent+label')
+                        st.plotly_chart(fig_pie2, use_container_width=True)
+                    else:
+                        st.info(f"No category data found for {selected_branch}.")
+                else:
+                    st.info("No branch data available.")
+    </script>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.39.0/build/stlite.js"></script>
+    <script>
+      const pythonCode = document.getElementById("my_python_code").textContent;
+      stlite.mount(
+        {
+          requirements: ["pandas", "openpyxl", "jinja2", "matplotlib", "plotly==5.23.0"],
+          entrypoint: "kpi_app.py", 
+          files: {
+            "kpi_app.py": pythonCode 
+          }
+        },
+        document.getElementById("root")
+      );
+    </script>
+  </body>
+</html>
